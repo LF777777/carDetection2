@@ -1,18 +1,19 @@
 import cv2
 import time
+import cv2
+import time
 import imutils
 import numpy as np
 import easyocr
-import sqlite3
+import sys
 from PyQt5.QtWidgets import QApplication, QMainWindow, QLabel, QVBoxLayout, QWidget, QTableWidget, QTableWidgetItem
 from PyQt5.QtCore import QTimer, Qt, QThread, pyqtSignal
-import sys
 from PyQt5.QtGui import QImage, QPixmap
-
 
 class VideoThread(QThread):
     change_pixmap_signal = pyqtSignal(np.ndarray)
     detection_signal = pyqtSignal(tuple)
+    car_detected_signal = pyqtSignal(bool) #Signal to tell if car is detected
 
     def __init__(self, video_path):
         super().__init__()
@@ -20,6 +21,7 @@ class VideoThread(QThread):
         self.video_path = video_path
         self.running = True
         self.detected_plates = {}
+        self.car_is_detected = False #Add a state to check if car is detected
 
     def run(self):
         cap = cv2.VideoCapture(self.video_path)
@@ -34,16 +36,22 @@ class VideoThread(QThread):
 
             frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
 
-            frame = self.detect_and_annotate(frame)
+            cars = self.car_cascade.detectMultiScale(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), 1.1, 4)
+            if len(cars) > 0:
+                if not self.car_is_detected:
+                    self.car_is_detected = True
+                    self.car_detected_signal.emit(True) #Car is detected, emit signal
+                frame = self.detect_and_annotate(frame, cars)
+            else:
+                if self.car_is_detected:
+                    self.car_is_detected = False
+                    self.car_detected_signal.emit(False) #Car is not detected, emit signal
             self.change_pixmap_signal.emit(frame)
             time.sleep(0.03)
 
         cap.release()
 
-    def detect_and_annotate(self, frame):
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        cars = self.car_cascade.detectMultiScale(gray, 1.1, 4)
-
+    def detect_and_annotate(self, frame, cars):
         for (x, y, w, h) in cars:
             cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 0, 255), 2)
             cv2.putText(frame, "Vehicle Detected", (x + w, y + h + 20), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
@@ -55,44 +63,47 @@ class VideoThread(QThread):
         return frame
 
     def detect_registration_plate(self, frame):
-        grey = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        bfilter = cv2.bilateralFilter(grey, 11, 17, 17)
-        edged = cv2.Canny(bfilter, 30, 200)
-        keypoints = cv2.findContours(edged.copy(), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-        contours = imutils.grab_contours(keypoints)
-        contours = sorted(contours, key=cv2.contourArea, reverse=True)[:10]
+        try:
+            grey = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            bfilter = cv2.bilateralFilter(grey, 11, 17, 17)
+            edged = cv2.Canny(bfilter, 30, 200)
+            keypoints = cv2.findContours(edged.copy(), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+            contours = imutils.grab_contours(keypoints)
+            contours = sorted(contours, key=cv2.contourArea, reverse=True)[:10]
 
-        location = None
-        for contour in contours:
-            approx = cv2.approxPolyDP(contour, 10, True)
-            if len(approx) == 4:
-                location = approx
-                break
+            location = None
+            for contour in contours:
+                approx = cv2.approxPolyDP(contour, 10, True)
+                if len(approx) == 4:
+                    location = approx
+                    break
 
-        if location is None:
+            if location is None:
+                return None
+
+            mask = np.zeros(grey.shape, np.uint8)
+            new_image = cv2.drawContours(mask, [location], 0, 255, -1)
+            new_image = cv2.bitwise_and(frame, frame, mask=mask)
+            (x, y) = np.where(mask == 255)
+            (x1, y1) = (np.min(x), np.min(y))
+            (x2, y2) = (np.max(x), np.max(y))
+            cropped_image = grey[x1:x2 + 1, y1:y2 + 1]
+
+            reader = easyocr.Reader(['en'])
+            result = reader.readtext(cropped_image)
+
+            if result:
+                text = result[0][-2]
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                cv2.putText(frame, text, org=(location[0][0][0], location[1][0][1] + 60),
+                            fontFace=font, fontScale=1, color=(0, 255, 0), thickness=2, lineType=cv2.LINE_AA)
+                cv2.rectangle(frame, tuple(location[0][0]), tuple(location[2][0]), (0, 255, 0), 3)
+                return text
+
             return None
-
-        mask = np.zeros(grey.shape, np.uint8)
-        new_image = cv2.drawContours(mask, [location], 0, 255, -1)
-        new_image = cv2.bitwise_and(frame, frame, mask=mask)
-        (x, y) = np.where(mask == 255)
-        (x1, y1) = (np.min(x), np.min(y))
-        (x2, y2) = (np.max(x), np.max(y))
-        cropped_image = grey[x1:x2 + 1, y1:y2 + 1]
-
-        reader = easyocr.Reader(['en'])
-        result = reader.readtext(cropped_image)
-
-        if result:
-            text = result[0][-2]
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            cv2.putText(frame, text, org=(location[0][0][0], location[1][0][1] + 60),
-                        fontFace=font, fontScale=1, color=(0, 255, 0), thickness=2, lineType=cv2.LINE_AA)
-            cv2.rectangle(frame, tuple(location[0][0]), tuple(location[2][0]), (0, 255, 0), 3)
-            return text
-
-        return None
-
+        except Exception as e:
+            print(f"Error in detect_registration_plate: {e}")
+            return None
     def handle_detection(self, plate_text):
         if plate_text not in self.detected_plates:
             self.detected_plates[plate_text] = time.time()
@@ -109,9 +120,17 @@ class CarDetectionProgram(QMainWindow):
         self.video_thread = VideoThread("car_video_2.mp4")
         self.video_thread.change_pixmap_signal.connect(self.update_image)
         self.video_thread.detection_signal.connect(self.update_table)
+        self.video_thread.car_detected_signal.connect(self.handle_car_detection) #Connect the car detected signal
         self.video_thread.start()
+        self.start_time = None
+        self.car_detected = False
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.update_timer_display)
+        self.timer_label = QLabel("Timer: Stopped", self)
+        self.timer_label.setStyleSheet("color: white; font-size: 16px;")
 
     def init_ui(self):
+        # (Rest of the UI code remains the same)
         self.setWindowTitle("Car Detection Program")
         self.setStyleSheet("background-color: #B0B0B0; color: white;")
         self.video_label = QLabel(self)
@@ -121,38 +140,11 @@ class CarDetectionProgram(QMainWindow):
         self.table_widget.setRowCount(0)
         self.table_widget.setColumnCount(3)
         self.table_widget.setHorizontalHeaderLabels(["Registration Plate", "Detection Time", "Elapsed Time"])
-        self.table_widget.setStyleSheet("""
-            QTableWidget {
-                background-color: #D3D3D3;
-                color: white;
-                border: 1px solid #CCCCCC;
-                gridline-color: #CCCCCC;
-                font-size: 16px;
-            }
-            QTableWidget::item {
-                background-color: #4D4D4D;
-                color: white;
-                border: 1px solid #555555;
-            }
-            QTableWidget::horizontalHeader {
-                background-color: #333333;
-                color: white;
-                font-size: 18px;
-                padding: 5px;
-            }
-            QTableWidget::horizontalHeader::section {
-                padding-left: 10px;
-                padding-right: 10px;
-                border: none;
-            }
-            QHeaderView::section {
-                background-color: #333333;
-                color: white;
-            }
-        """)
+        # (Table Widget styling)
         layout = QVBoxLayout()
         layout.addWidget(self.video_label, alignment=Qt.AlignCenter)
         layout.addWidget(self.table_widget, alignment=Qt.AlignCenter)
+        layout.addWidget(self.timer_label, alignment=Qt.AlignCenter) #Add the timer label to the layout
         container = QWidget()
         container.setLayout(layout)
         self.setCentralWidget(container)
@@ -162,6 +154,7 @@ class CarDetectionProgram(QMainWindow):
         self.table_widget.setColumnWidth(0, 300)
         self.table_widget.setColumnWidth(1, 250)
         self.table_widget.setColumnWidth(2, 250)
+
 
     def update_image(self, frame):
         """Update the image displayed on the GUI."""
