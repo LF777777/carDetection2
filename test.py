@@ -1,7 +1,9 @@
 import cv2
 import time
+import imutils
 import numpy as np
 import easyocr
+import sqlite3
 from PyQt5.QtWidgets import QApplication, QMainWindow, QLabel, QVBoxLayout, QWidget, QTableWidget, QTableWidgetItem
 from PyQt5.QtCore import QTimer, Qt, QThread, pyqtSignal
 import sys
@@ -28,8 +30,27 @@ class VideoThread(QThread):
             if not ret:
                 break
 
-            # Perform car detection and license plate extraction here
-            frame = self.detect_and_annotate(frame)
+            # Perform car detection and license plate extraction
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            cars = self.car_cascade.detectMultiScale(gray, 1.1, 9)
+
+            for (x, y, w, h) in cars:
+                plate = frame[y:y + h, x:x + w]
+                cv2.rectangle(frame, (x, y), (x + w, y + h), (51, 51, 255), 2)
+                cv2.rectangle(frame, (x, y - 40), (x + w, y), (51, 51, 255), -2)
+                cv2.putText(frame, 'Car', (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                cv2.imshow('car', plate)
+
+                # Detect the registration plate
+                plate_text = self.detect_registration_plate(frame[y:y + h, x:x + w])
+                if plate_text:
+                    if not self.car_detected:  # Start the timer when the first car is detected
+                        self.start_timer()  # Start the timer if the car is detected for the first time
+                    else:  # Stop the timer when the same car is detected again
+                        self.stop_timer()
+
+                    # Handle the detection of the license plate and store data
+                    self.handle_detection(plate_text)
 
             # Emit signal to update the video frame in the GUI
             self.change_pixmap_signal.emit(frame)
@@ -38,27 +59,6 @@ class VideoThread(QThread):
             time.sleep(0.03)  # Adjust this to match video frame rate
 
         cap.release()
-
-    def detect_and_annotate(self, frame):
-        # Detect cars and license plate here (refer to your detection methods)
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        cars = self.car_cascade.detectMultiScale(gray, 1.1, 4)
-
-        for (x, y, w, h) in cars:
-            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 0, 255), 2)
-            cv2.putText(frame, "Vehicle Detected", (x + w, y + h + 20), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-
-            plate_text = self.detect_registration_plate(frame[y:y + h, x:x + w])
-            if plate_text:
-                if not window.car_detected:  # Start the timer when the first car is detected
-                    window.start_timer()  # Start the timer if the car is detected for the first time
-                else:  # Stop the timer when the same car is detected again
-                    window.stop_timer()
-
-                # Handle the detection of the license plate and store data
-                window.handle_detection(plate_text)
-
-        return frame
 
     def detect_registration_plate(self, frame):
         # Convert the frame to grayscale
@@ -120,6 +120,10 @@ class VideoThread(QThread):
 
         return None
 
+    def handle_detection(self, plate_text):
+        # Handle the detection of a car's license plate here (e.g., store data, show in GUI, etc.)
+        print(f"Detected plate: {plate_text}")
+
 
 class CarDetectionProgram(QMainWindow):
     def __init__(self):
@@ -127,11 +131,8 @@ class CarDetectionProgram(QMainWindow):
 
         # Initialize variables
         self.timer_label = None
-        self.car_cascade = cv2.CascadeClassifier("cars.xml")  # Use OpenCV's pre-trained car cascade
-        self.start_time = None
         self.car_detected = False
-        self.registration_plate = None
-        self.car_timer = {}  # Dictionary to track timers for each detected car
+        self.start_time = None
 
         # Setup GUI
         self.init_ui()
@@ -212,6 +213,15 @@ class CarDetectionProgram(QMainWindow):
         # Set a larger window size and ensure table expands accordingly
         self.setGeometry(100, 100, 1000, 800)  # Larger window size (1000x800)
 
+        # Make the table widget larger
+        self.table_widget.setMinimumWidth(800)  # Set minimum width for table
+        self.table_widget.setMinimumHeight(600)  # Set minimum height for table
+
+        # Adjust column widths for more space
+        self.table_widget.setColumnWidth(0, 300)  # Set column 1 (Plate) width to 300px
+        self.table_widget.setColumnWidth(1, 250)  # Set column 2 (Detection Time) width to 250px
+        self.table_widget.setColumnWidth(2, 250)  # Set column 3 (Timer)
+
     def update_image(self, frame):
         """Update the image displayed on the GUI."""
         # Convert the image from BGR to RGB
@@ -244,19 +254,6 @@ class CarDetectionProgram(QMainWindow):
             elapsed_time = self.end_time - self.start_time
             self.timer_label.setText(f"Timer stopped - {elapsed_time:.2f} seconds")
             self.timer.stop()  # Stop the timer when the car detection ends
-
-    def handle_detection(self, plate_text):
-        """Add the plate number and timer information to the table."""
-        # Record the detection time and add a new row to the table
-        current_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(self.start_time))
-        elapsed_time = time.time() - self.start_time
-
-        # Add new row to the table with detected plate, time, and elapsed timer
-        row_position = self.table_widget.rowCount()
-        self.table_widget.insertRow(row_position)
-        self.table_widget.setItem(row_position, 0, QTableWidgetItem(plate_text))
-        self.table_widget.setItem(row_position, 1, QTableWidgetItem(current_time))
-        self.table_widget.setItem(row_position, 2, QTableWidgetItem(f"{elapsed_time:.2f} seconds"))
 
 
 if __name__ == "__main__":
