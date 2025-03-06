@@ -1,127 +1,12 @@
 import cv2
-import time
-import imutils
 import numpy as np
 import easyocr
+import imutils
 import sqlite3
-from PyQt5.QtWidgets import QApplication, QMainWindow, QLabel, QVBoxLayout, QWidget, QTableWidget, QTableWidgetItem
-from PyQt5.QtCore import QTimer, Qt, QThread, pyqtSignal
+from PyQt5.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QTableWidget, QTableWidgetItem, QLabel, QWidget
+from PyQt5.QtCore import QTimer, Qt
 import sys
-from PyQt5.QtGui import QImage, QPixmap
-
-
-class VideoThread(QThread):
-    change_pixmap_signal = pyqtSignal(np.ndarray)
-
-    def __init__(self, video_path):
-        super().__init__()
-        self.car_cascade = cv2.CascadeClassifier("cars.xml")
-        self.video_path = video_path
-        self.running = True
-
-    def run(self):
-
-        cap = cv2.VideoCapture(self.video_path)
-        if not cap.isOpened():
-            print("Error: can't open video capture.")
-            sys.exit()
-
-        while self.running:
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            # Perform car detection and license plate extraction here
-            frame = self.detect_and_annotate(frame)
-
-            # Emit signal to update the video frame in the GUI
-            self.change_pixmap_signal.emit(frame)
-
-            # Sleep to match the frame rate of the video
-            time.sleep(0.03)  # Adjust this to match video frame rate
-
-        cap.release()
-
-    def detect_and_annotate(self, frame):
-        # Detect cars and license plate here (refer to your detection methods)
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        cars = self.car_cascade.detectMultiScale(gray, 1.1, 4)
-
-        for (x, y, w, h) in cars:
-            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 0, 255), 2)
-            cv2.putText(frame, "Vehicle Detected", (x + w, y + h + 20), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-
-            plate_text = self.detect_registration_plate(frame[y:y + h, x:x + w])
-            if plate_text:
-                if not self.car_detected:  # Start the timer when the first car is detected
-                    self.start_timer()  # Start the timer if the car is detected for the first time
-                else:  # Stop the timer when the same car is detected again
-                    self.stop_timer()
-
-                # Handle the detection of the license plate and store data
-                self.handle_detection(plate_text)
-
-        return frame
-
-    def detect_registration_plate(self, frame):
-        # Convert the frame to grayscale
-        grey = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-        # Apply bilateral filtering to remove noise while keeping edges sharp
-        bfilter = cv2.bilateralFilter(grey, 11, 17, 17)
-
-        # Apply Canny edge detection
-        edged = cv2.Canny(bfilter, 30, 200)
-
-        # Find contours in the edged image
-        keypoints = cv2.findContours(edged.copy(), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-        contours = imutils.grab_contours(keypoints)
-
-        # Sort contours by area in descending order and take top 10
-        contours = sorted(contours, key=cv2.contourArea, reverse=True)[:10]
-
-        location = None
-        # Iterate through contours to find a quadrilateral contour
-        for contour in contours:
-            approx = cv2.approxPolyDP(contour, 10, True)  # Approximate the contour with fewer points
-            if len(approx) == 4:  # A rectangle will have 4 corners
-                location = approx
-                break
-
-        if location is None:
-            return None  # No license plate found
-
-        # Create a mask to isolate the region of interest (license plate)
-        mask = np.zeros(grey.shape, np.uint8)
-        new_image = cv2.drawContours(mask, [location], 0, 255, -1)
-        new_image = cv2.bitwise_and(frame, frame, mask=mask)
-
-        # Get coordinates for cropping the image to the license plate region
-        (x, y) = np.where(mask == 255)
-        (x1, y1) = (np.min(x), np.min(y))
-        (x2, y2) = (np.max(x), np.max(y))
-
-        # Crop the image to the region of interest (license plate area)
-        cropped_image = grey[x1:x2 + 1, y1:y2 + 1]
-
-        # Use EasyOCR to detect the text (registration plate) in the cropped region
-        reader = easyocr.Reader(['en'])
-        result = reader.readtext(cropped_image)
-
-        if result:
-            # Extract the text from OCR result
-            text = result[0][-2]
-
-            # Draw the rectangle around the detected license plate and add the text
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            cv2.putText(frame, text, org=(location[0][0][0], location[1][0][1] + 60),
-                        fontFace=font, fontScale=1, color=(0, 255, 0), thickness=2, lineType=cv2.LINE_AA)
-            cv2.rectangle(frame, tuple(location[0][0]), tuple(location[2][0]), (0, 255, 0), 3)
-
-            # Return the detected registration plate text
-            return text
-
-        return None
+import time
 
 
 class CarDetectionProgram(QMainWindow):
@@ -129,34 +14,42 @@ class CarDetectionProgram(QMainWindow):
         super().__init__()
 
         # Initialize variables
-        self.timer_label = None
         self.car_cascade = cv2.CascadeClassifier("cars.xml")  # Use OpenCV's pre-trained car cascade
-        self.start_time = None
+        self.reader = easyocr.Reader(['en'])  # EasyOCR reader for OCR
+        self.timer_label = None
         self.car_detected = False
         self.registration_plate = None
         self.car_timer = {}  # Dictionary to track timers for each detected car
+        self.start_time = None
 
-        # Setup GUI
+        # Setup Video Capture
+        self.cap = cv2.VideoCapture('car_video.mp4')  # Use the path to your video file
+        if not self.cap.isOpened():
+            print("Error: can't open video.")
+            sys.exit()
+
+        # Create a database to store detected car registration numbers
+        self.db_connection = sqlite3.connect('car_detection.db')
+        self.db_cursor = self.db_connection.cursor()
+        self.db_cursor.execute("""
+            CREATE TABLE IF NOT EXISTS car_detection (
+                registration_plate TEXT,
+                detection_time REAL
+            )
+        """)
+        self.db_connection.commit()
+
+        # GUI Setup
         self.init_ui()
-
-        # Create VideoThread and connect signals
-        self.video_thread = VideoThread("car_video_2.mp4")  # Replace with your video file path
-        self.video_thread.change_pixmap_signal.connect(self.update_image)
-        self.video_thread.start()
 
         # Start timer to update GUI
         self.timer = QTimer(self)
-        self.timer.timeout.connect(self.update_timer_display)  # Connect the timer to update the display every second
+        self.timer.timeout.connect(self.update_timer_display)
 
     def init_ui(self):
         # Set the main window title and background color
         self.setWindowTitle("Car Detection Program")
         self.setStyleSheet("background-color: #B0B0B0; color: white;")  # Set greyish background and white text
-
-        # Create a label to display the video frames
-        self.video_label = QLabel(self)
-        self.video_label.setAlignment(Qt.AlignCenter)
-        self.video_label.setStyleSheet("background-color: black;")  # Set a black background for the video label
 
         # Create a table to display the detection data
         self.table_widget = QTableWidget(self)
@@ -199,14 +92,7 @@ class CarDetectionProgram(QMainWindow):
 
         # Center the table in the window and increase size
         layout = QVBoxLayout()
-        layout.addWidget(self.video_label, alignment=Qt.AlignCenter)  # Add the video label to the layout
-        layout.addWidget(self.table_widget, alignment=Qt.AlignCenter)  # Add the table widget to the layout
-
-        # Create a label to show the timer
-        self.timer_label = QLabel("Timer: 0.00", self)
-        self.timer_label.setAlignment(Qt.AlignCenter)
-        self.timer_label.setStyleSheet("font-size: 20px; color: white;")
-        layout.addWidget(self.timer_label, alignment=Qt.AlignCenter)  # Add the timer label to the layout
+        layout.addWidget(self.table_widget, alignment=Qt.AlignCenter)  # This centers the table
 
         container = QWidget()
         container.setLayout(layout)
@@ -224,42 +110,167 @@ class CarDetectionProgram(QMainWindow):
         self.table_widget.setColumnWidth(1, 250)  # Set column 2 (Detection Time) width to 250px
         self.table_widget.setColumnWidth(2, 250)  # Set column 3 (Timer)
 
-    def update_image(self, frame):
-        """Update the image displayed on the GUI."""
-        # Convert the image from BGR to RGB
-        rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        h, w, ch = rgb_image.shape
-        bytes_per_line = ch * w
-        q_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
-        pixmap = QPixmap(q_image)
-
-        # Update the video display label
-        self.video_label.setPixmap(pixmap)
-
-    def update_timer_display(self):
-        """Update the timer label."""
-        if self.car_detected and self.start_time:
-            # Calculate the elapsed time
-            elapsed_time = time.time() - self.start_time
-            # Update the timer label with the new elapsed time (convert to seconds)
-            self.timer_label.setText(f"Timer: {elapsed_time:.2f} seconds")
-
     def start_timer(self):
-        self.start_time = time.time()  # Store the start time
-        self.car_detected = True  # Mark that a car has been detected and the timer has started
+        self.start_time = time.time()
+        self.car_detected = True  # Mark that the car has been detected and timer started
         self.timer_label.setText("Timer: Running...")
-        self.timer.start(1000)  # Start the timer to update every second
+        self.timer.start(1000)  # Update the timer every second
 
     def stop_timer(self):
         if self.start_time:
             self.end_time = time.time()
             elapsed_time = self.end_time - self.start_time
             self.timer_label.setText(f"Timer stopped - {elapsed_time:.2f} seconds")
-            self.timer.stop()  # Stop the timer when the car detection ends
+            self.store_car_data_db(self.registration_plate, elapsed_time)  # Store with elapsed time
+
+    def car_detection(self, frame):
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        cars = self.car_cascade.detectMultiScale(gray, 1.1, 4)
+
+        if len(cars) == 0:
+            return frame
+
+        for (x, y, w, h) in cars:
+            # Draw a bounding box around the detected car
+            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 0, 255), 2)
+
+            # Extract the region of interest (ROI)
+            roi = frame[y:y + h, x:x + w]
+
+            # Detect the license plate in the ROI
+            plate_text = self.detect_registration_plate(roi)
+            if plate_text:
+                self.handle_detection(plate_text)
+
+        return frame
+
+    def detect_registration_plate(self, frame):
+        # Convert the frame to grayscale
+        grey = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        # Apply bilateral filtering to remove noise while keeping edges sharp
+        bfilter = cv2.bilateralFilter(grey, 11, 17, 17)
+
+        # Apply Canny edge detection to detect edges
+        edged = cv2.Canny(bfilter, 30, 200)
+
+        # Find contours in the edged image
+        keypoints = cv2.findContours(edged.copy(), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        contours = imutils.grab_contours(keypoints)
+
+        # Sort contours by area in descending order and take the largest ones
+        contours = sorted(contours, key=cv2.contourArea, reverse=True)[:10]
+
+        location = None
+        for contour in contours:
+            approx = cv2.approxPolyDP(contour, 10, True)
+            if len(approx) == 4:  # A rectangle will have 4 corners (license plate)
+                location = approx
+                break
+
+        if location is None:
+            return None  # No license plate found
+
+        # Create a mask to isolate the license plate
+        mask = np.zeros(grey.shape, np.uint8)
+        new_image = cv2.drawContours(mask, [location], 0, 255, -1)
+        new_image = cv2.bitwise_and(frame, frame, mask=mask)
+
+        # Get coordinates for cropping the license plate area
+        (x, y) = np.where(mask == 255)
+        (x1, y1) = (np.min(x), np.min(y))
+        (x2, y2) = (np.max(x), np.max(y))
+
+        # Crop to the region of interest (license plate area)
+        cropped_image = grey[x1:x2 + 1, y1:y2 + 1]
+
+        # Use EasyOCR to detect the text in the cropped region
+        result = self.reader.readtext(cropped_image)
+
+        if result:
+            text = result[0][-2]
+
+            # Draw the rectangle around the detected license plate and add the text
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            cv2.putText(frame, text, org=(location[0][0][0], location[1][0][1] + 60),
+                        fontFace=font, fontScale=1, color=(0, 255, 0), thickness=2, lineType=cv2.LINE_AA)
+            cv2.rectangle(frame, tuple(location[0][0]), tuple(location[2][0]), (0, 255, 0), 3)
+
+            return text
+
+        return None
+
+    def handle_detection(self, plate_text):
+        # Handle the timer and registration plate tracking logic
+        current_time = time.time()
+
+        if plate_text not in self.car_timer:
+            # If the car is detected for the first time, start a new timer
+            self.car_timer[plate_text] = {'start_time': current_time, 'timer_running': True}
+            self.timer_label.setText(f"Timer: Running... Car Plate: {plate_text}")
+            self.timer.start(1000)  # Update every second
+        else:
+            # If the car has been detected before, stop the timer
+            if self.car_timer[plate_text]['timer_running']:
+                elapsed_time = current_time - self.car_timer[plate_text]['start_time']
+                self.car_timer[plate_text]['timer_running'] = False
+                self.store_car_data_db(plate_text, elapsed_time)
+                self.timer_label.setText(f"Timer stopped for {plate_text} - {elapsed_time:.2f} seconds")
+
+    def store_car_data_db(self, plate_text, elapsed_time):
+        self.db_cursor.execute("INSERT INTO car_detection (registration_plate, detection_time) VALUES (?, ?)",
+                               (plate_text, elapsed_time))
+        self.db_connection.commit()
+        self.update_table_widget()  # Update the table when new data is stored
+
+    def update_table_widget(self):
+        # Fetch all data from the database and update the table
+        self.db_cursor.execute("SELECT registration_plate, detection_time FROM car_detection")
+        rows = self.db_cursor.fetchall()
+
+        # Clear the existing data in the table
+        self.table_widget.setRowCount(0)
+
+        # Insert the fetched data into the table
+        for row in rows:
+            row_position = self.table_widget.rowCount()
+            self.table_widget.insertRow(row_position)
+            self.table_widget.setItem(row_position, 0, QTableWidgetItem(row[0]))  # Registration Plate
+            self.table_widget.setItem(row_position, 1, QTableWidgetItem(f"{row[1]:.2f}"))  # Detection Time
+            self.table_widget.setItem(row_position, 2, QTableWidgetItem(f"{time.time() - row[1]:.2f}"))  # Timer
+
+    def capture_screen(self):
+        while True:
+            ret, frame = self.cap.read()
+            if not ret:
+                break
+
+            # Process the frame with car detection
+            processed_frame = self.car_detection(frame)
+
+            # Display the frame with car detection and license plate detection
+            cv2.imshow("Car Detection", processed_frame)
+
+            # Exit the loop when 'q' is pressed
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
+        self.cap.release()
+        cv2.destroyAllWindows()
+
+    def update_timer_display(self):
+        # Update the timer label every second
+        if self.car_detected and self.start_time:
+            elapsed_time = time.time() - self.start_time
+            self.timer_label.setText(f"Timer: {elapsed_time:.2f} seconds")
+        else:
+            self.timer_label.setText("Timer: Not Started")
 
 
+# Example usage:
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     window = CarDetectionProgram()
     window.show()
-    sys.exit(app.exec())
+    window.capture_screen()  # Start video processing
+    sys.exit(app.exec_())
